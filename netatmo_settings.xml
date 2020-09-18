@@ -1,0 +1,6 @@
+<settings>
+	<authentication client_id="" client_secret="" password="" username="" />
+	<domoticz hardware_id="2" url="http://DOMOTICZ_IP:8080" />
+	<devices>
+	</devices>
+</settings>

@@ -1,828 +1,519 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+"""
+netatmo_mqtt.py
 
-import sys
-import os
-import string
+Requirements
+- Python 3.9+
+- paho-mqtt (pip install paho-mqtt)
+
+Configuration
+- netatmo_settings.xml in the same folder (auto-generated skeleton if missing)
+
+Security note
+- TLS verification is enabled by default.
+  Use --insecure only for debugging on trusted networks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
 import json
-import urllib
-import datetime
-import xml.etree.ElementTree as ET
-import pdb
+import logging
+import os
 import ssl
-import paho.mqtt.client as mqtt
+import sys
 import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import paho.mqtt.client as mqtt
+
+# -----------------------------
+# Constants / Defaults
+# -----------------------------
+NETATMO_TOKEN_URL = "https://api.netatmo.com/oauth2/token"
+NETATMO_GETSTATIONSDATA_URL = "https://api.netatmo.com/api/getstationsdata"
+
+DEFAULT_MQTT_HOST = "localhost"
+DEFAULT_MQTT_PORT = 1883
+
+DEFAULT_CACHE_TTL_SECONDS = 150  # old code: minNetatmoServerConnect
+STALE_READING_SECONDS = 3000     # old code: difOutTime/difInTime > 3000 => outofdate
+
+TOKEN_XML = "token.xml"
+MEASURES_XML = "measures.xml"
+SETTINGS_XML = "netatmo_settings.xml"
+
+# XML node names (kept for compatibility with your original repo)
+SETTINGS_ROOT = "settings"
+NODE_AUTH = "authentication"
+ATTR_AUTH_CLIENT_ID = "client_id"
+ATTR_AUTH_CLIENT_SECRET = "client_secret"
+ATTR_AUTH_USERNAME = "username"
+ATTR_AUTH_PASSWORD = "password"
 
 
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-
-minNetatmoServerConnect = 150;
-
-####################################################################################################
-## MQTT constants
-####################################################################################################
-MQTT_SERVER = "localhost"
-client = mqtt.Client()
+# -----------------------------
+# Data Models
+# -----------------------------
+@dataclass(frozen=True)
+class Authentication:
+    client_id: str
+    client_secret: str
+    username: str
+    password: str
 
 
-####################################################################################################
-## Netatmo constants
-####################################################################################################
+@dataclass
+class Token:
+    access_token: str
+    refresh_token: str
+    expires_in: int
+    expired_at: dt.datetime
 
-URL_RequestToken = 'https://api.netatmo.com/oauth2/token'
-                 ## https://api.netatmo.com/oauth2/token
-URL_DeviceList = 'http://api.netatmo.com/api/devicelist'
-URL_GetMeasure = 'http://api.netatmo.com/api/getmeasure'
-URL_GetStationData = 'https://api.netatmo.com/api/getstationsdata'
-                ##https://api.netatmo.com/api/getstationsdata
-
-PARM_Grant_Type = 'grant_type'
-PARM_Grant_Type_Password = 'password'
-PARM_Grant_Type_RefreshToken = 'refresh_token'
-PARM_Client_Id = 'client_id'
-PARM_Client_Secret = 'client_secret'  
-PARM_Username = 'username'
-PARM_Password = 'password'
-PARM_Refresh_Token = 'refresh_token'
-
-PARM_Access_Token = 'access_token'
-PARM_Device_Id = 'device_id'
-PARM_Module_Id = 'module_id'
-PARM_Scale = 'scale'
-PARM_Scale_Max = 'max'
-PARM_Scale_30Min = '30min'
-PARM_Scale_1Hour = '1hour'
-PARM_Scale_3Hours = '3hours'
-PARM_Scale_1Day = '1day'
-PARM_Scale_1Week = '1week'
-PARM_Scale_1Month = '1month'
-
-PARM_Measure_Type = 'type'
-PARM_Date_Begin = 'date_begin'
-PARM_Date_End = 'date_end'
-PARM_Date_End_Last = 'last'
-PARM_Limit = 'limit'
-PARM_Optimize = 'optimize'
-PARM_Real_Time = 'real_time'
-
-DATATYPE_Temperature = 'Temperature'
-DATATYPE_Humidity = 'Humidity'
-DATATYPE_CO2 = 'Co2'
-DATATYPE_Pressure = 'Pressure'
-DATATYPE_Noise = 'Noise'
-
-RESPONSE_Status = 'status'
-RESPONSE_Status_OK = 'ok'
-RESPONSE_Body = 'body'
+    @property
+    def is_expiring_soon(self) -> bool:
+        # Refresh if expires within 30 seconds
+        return self.expired_at <= dt.datetime.now() + dt.timedelta(seconds=30)
 
 
-####################################################################################################
-## DomoticZ constants
-####################################################################################################
+@dataclass
+class Measures:
+    # Outdoor (module)
+    out_temperature: str
+    out_humidity: str
+    out_time_utc: str
+    out_time_utc_str: str
+    out_min_temp: str
+    out_max_temp: str
 
-URL_JSON = "/json.htm"
-PARM_Type = "type"
-PARM_Type_Command = "command"
-PARM_Param = "param"
-PARM_Param_UpdateDevice = "udevice"
-PARM_HardwareId = "hid"
-PARM_DeviceId = "did"
-PARM_DeviceUnit = "dunit"
-PARM_DeviceType = "dtype"
-PARM_DeviceSubType = "dsubtype"
-PARM_NValue = "nvalue"
-PARM_SValue = "svalue"
+    # Indoor (main device)
+    in_temperature: str
+    in_humidity: str
+    in_pressure: str
+    in_co2: str
+    in_time_utc: str
+    in_time_utc_str: str
 
-# status types for humidity
-HUMSTAT_NORMAL = 0x0;
-HUMSTAT_COMFORT = 0x1;
-HUMSTAT_DRY = 0x2;
-HUMSTAT_WET = 0x3;
-
-
-####################################################################################################
-## XML constants
-####################################################################################################
-
-TOKEN_ROOT = 'token'
-TOKEN_ATTR_ACCESS_TOKEN = 'access_token'
-TOKEN_ATTR_EXPIRES_IN = 'expires_in' 
-TOKEN_ATTR_REFRESH_TOKEN = 'refresh_token'
-TOKEN_ATTR_EXPIRED_AT = 'expired_at'
-
-MEASURE_ROOT = 'measures'
-MEASURE_outTemperature = 'out_temperature'
-MEASURE_outHumidity = 'outHumidity'
-##MEASURE_outTemp_trend = 'outTemp_trend'
-MEASURE_outtime_utc = 'outtime_utc'
-MEASURE_inTemperature = 'inTemperature'
-MEASURE_inNoise =  'inNoise'
-MEASURE_intime_utc = 'intime_utc' 
-MEASURE_inpressure_trend =  'inpressure_trend'
-MEASURE_inHumidity = 'inHumidity'
-MEASURE_inPressure = 'inPressure'
-MEASURE_inCO2 = 'inCO2'
-MEASURE_inAbsolutePressure = 'inAbsolutePressure'
-MEASURE_intime_utc_str= 'intime_utc_str'
-MEASURE_outtime_utc_str = 'outtime_utc_str'
-MEASURE_outMinTemp = 'outMinTemp'
-MEASURE_outMaxTemp = 'outMaxTemp'
+    def to_mqtt_payloads(self) -> Dict[str, str]:
+        return {
+            "netatmo/outTemperature": self.out_temperature,
+            "netatmo/outHumidity": self.out_humidity,
+            "netatmo/outtime_utc": self.out_time_utc,
+            "netatmo/outtime_utc_str": self.out_time_utc_str,
+            "netatmo/outMinTemp": self.out_min_temp,
+            "netatmo/outMaxTemp": self.out_max_temp,
+            "netatmo/inTemperature": self.in_temperature,
+            "netatmo/inHumidity": self.in_humidity,
+            "netatmo/inPressure": self.in_pressure,
+            "netatmo/inCO2": self.in_co2,
+            "netatmo/intime_utc": self.in_time_utc,
+            "netatmo/intime_utc_str": self.in_time_utc_str,
+        }
 
 
-SETTINGS_ROOT = 'settings'
-NODE_AUTHENTICATE = 'authentication'
-ATTR_AUTH_CLIENT_ID = 'client_id'
-ATTR_AUTH_CLIENT_SECRET= 'client_secret'
-ATTR_AUTH_USERNAME = 'username'
-ATTR_AUTH_PASSWORD = 'password'
-
-NODE_DOMOTICZ = 'domoticz'
-ATTR_DOMOTICZ_URL = 'url'
-ATTR_DOMOTICZ_HARDWARE_ID = 'hardware_id'
-
-DEVICES_ROOT = 'devices'
-DEVICES_NODE_DEVICE = 'device'
-DEVICES_NODE_MODULE = 'module' 
-DEVICES_ID = 'id'
-DEVICES_NODE_MEASURE = 'measure' 
+# -----------------------------
+# Utils
+# -----------------------------
+def working_dir() -> Path:
+    return Path(__file__).resolve().parent
 
 
-####################################################################################################
-## MQTT functiona
-####################################################################################################
-
-def on_connect(client, userdata, flags, rc):
-    print("MQTT Connected with result code "+str(rc))
-
-client.on_connect = on_connect
-
-def SendMeasuresMQTT(measures):
-    Log('SendMeasuresMQTT girdi')
-    client.connect(MQTT_SERVER, 1883, 60)
-    client.loop_start()
-    client.publish("netatmo/outTemperature", measures.get(MEASURE_outTemperature))
-    client.publish("netatmo/outHumidity", measures.get(MEASURE_outHumidity))
-    ##client.publish("netatmo/outTemp_trend", measures.get(MEASURE_outTemp_trend))
-    client.publish("netatmo/outtime_utc", measures.get(MEASURE_outtime_utc))
-    client.publish("netatmo/inTemperature", measures.get(MEASURE_inTemperature))
-   ## client.publish("netatmo/inNoise", measures.get(MEASURE_inNoise))
-    client.publish("netatmo/intime_utc", measures.get(MEASURE_intime_utc))
-    #client.publish("netatmo/inpressure_trend", measures.get(MEASURE_inpressure_trend))
-    client.publish("netatmo/inHumidity", measures.get(MEASURE_inHumidity))
-    client.publish("netatmo/inPressure", measures.get(MEASURE_inPressure))
-    client.publish("netatmo/inCO2", measures.get(MEASURE_inCO2))
-    ##client.publish("netatmo/inAbsolutePressure", measures.get(MEASURE_inAbsolutePressure))
-    client.publish("netatmo/intime_utc_str" , measures.get(MEASURE_intime_utc_str))
-    client.publish("netatmo/outtime_utc_str", measures.get(MEASURE_outtime_utc_str))
-    client.publish("netatmo/outMinTemp", measures.get(MEASURE_outMinTemp))
-    client.publish("netatmo/outMaxTemp", measures.get(MEASURE_outMaxTemp))
-    
-
-    time.sleep(4) # wait
-    client.loop_stop()
-    client.disconnect()
-    pass    
- 
-    
-####################################################################################################
-## General functiona
-####################################################################################################
-
-def Log(message):
-    sys.stderr.write("{}\n".format(message))
-    
-
-def GetWorkingPath():
-    return os.path.dirname(os.path.realpath(__file__)) + os.sep
+def build_ssl_context(insecure: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
-####################################################################################################
-## Access token handling
-####################################################################################################
-    
-def GetTokenFileName():
-    return GetWorkingPath() + "token.xml"
+def http_post_form(url: str, form: Dict[str, str], ctx: ssl.SSLContext, timeout: int = 20) -> str:
+    data = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
 
-def GetMeasuresFileName():
-    return GetWorkingPath() + "measures.xml"
 
-    
-def SaveToken(token):
-    Log('SaveToken girdi')
-    token_filename = GetTokenFileName()
-    if ET.iselement(token):
+def http_get(url: str, params: Dict[str, str], ctx: ssl.SSLContext, timeout: int = 20) -> str:
+    q = urllib.parse.urlencode(params)
+    full = f"{url}?{q}"
+    req = urllib.request.Request(full, method="GET")
+    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def parse_timestamp(ts: int) -> Tuple[str, str]:
+    # Returns (utc_ts_str, human_str)
+    human = dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d_%H:%M:%S")
+    return str(ts), human
+
+
+# -----------------------------
+# Settings
+# -----------------------------
+class SettingsStore:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load_or_create(self) -> Authentication:
+        if not self.path.exists():
+            logging.warning("Settings file not found: %s. Creating a skeleton.", self.path)
+            self._create_skeleton()
+
         try:
-            ET.ElementTree(token).write(token_filename)
+            root = ET.parse(self.path).getroot()
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse settings XML: {self.path}") from e
+
+        auth_node = root.find(f".//{NODE_AUTH}")
+        if auth_node is None:
+            raise RuntimeError(f"Missing <{NODE_AUTH}> section in {self.path}")
+
+        def get_attr(name: str) -> str:
+            v = auth_node.get(name, "").strip()
+            if not v or v in ("CLIENT_ID", "CLIENT_SECRET", "USERNAME", "PASSWORD"):
+                raise RuntimeError(
+                    f"Settings value '{name}' is not configured in {self.path}. "
+                    f"Edit the file and set real credentials."
+                )
+            return v
+
+        return Authentication(
+            client_id=get_attr(ATTR_AUTH_CLIENT_ID),
+            client_secret=get_attr(ATTR_AUTH_CLIENT_SECRET),
+            username=get_attr(ATTR_AUTH_USERNAME),
+            password=get_attr(ATTR_AUTH_PASSWORD),
+        )
+
+    def _create_skeleton(self) -> None:
+        root = ET.Element(SETTINGS_ROOT)
+        auth = ET.SubElement(root, NODE_AUTH)
+        auth.set(ATTR_AUTH_CLIENT_ID, "CLIENT_ID")
+        auth.set(ATTR_AUTH_CLIENT_SECRET, "CLIENT_SECRET")
+        auth.set(ATTR_AUTH_USERNAME, "USERNAME")
+        auth.set(ATTR_AUTH_PASSWORD, "PASSWORD")
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
+
+
+# -----------------------------
+# Token persistence (XML, compatible)
+# -----------------------------
+class TokenStoreXML:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> Optional[Token]:
+        if not self.path.exists():
+            return None
+        try:
+            root = ET.parse(self.path).getroot()
+            access_token = root.get("access_token", "")
+            refresh_token = root.get("refresh_token", "")
+            expires_in = int(root.get("expires_in", "0"))
+            expired_at_raw = root.get("expired_at", "")
+            if not access_token or not refresh_token or not expired_at_raw:
+                return None
+            expired_at = dt.datetime.strptime(expired_at_raw, "%Y-%m-%d %H:%M:%S")
+            return Token(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_in=expires_in,
+                expired_at=expired_at,
+            )
         except Exception:
-            Log('ERROR: in SaveToken(%s)' % token_filename)            
-            pass
-    pass
+            logging.exception("Failed to load token file: %s", self.path)
+            return None
 
+    def save(self, token: Token) -> None:
+        root = ET.Element("token")
+        root.set("access_token", token.access_token)
+        root.set("refresh_token", token.refresh_token)
+        root.set("expires_in", str(token.expires_in))
+        root.set("expired_at", token.expired_at.strftime("%Y-%m-%d %H:%M:%S"))
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
 
-    
-
-def DeleteTokenFile():
-    Log('DeleteTokenFile girdi')
-    token_filename = GetTokenFileName()
-    if os.path.isfile(token_filename):
+    def delete(self) -> None:
         try:
-            os.remove(token_filename)
-        except:            
-            Log('ERROR: in DeleteTokeFile(%s)' % token_filename)
-            pass
-    pass
-
-
-def CreateToken(json_data):
-    Log('CreateToken girdi')
-    newtoken = ET.Element(TOKEN_ROOT)
-    if newtoken != None and json_data != None:
-        json_decoded = json.loads(json_data)
-        newtoken.set(TOKEN_ATTR_ACCESS_TOKEN, json_decoded[TOKEN_ATTR_ACCESS_TOKEN])
-        newtoken.set(TOKEN_ATTR_EXPIRES_IN, str(json_decoded[TOKEN_ATTR_EXPIRES_IN]))
-        newtoken.set(TOKEN_ATTR_REFRESH_TOKEN, json_decoded[TOKEN_ATTR_REFRESH_TOKEN])
-        expired_at = datetime.datetime.now() + datetime.timedelta(seconds = json_decoded[TOKEN_ATTR_EXPIRES_IN])
-        newtoken.set(TOKEN_ATTR_EXPIRED_AT, expired_at.strftime("%Y-%m-%d %H:%M:%S"))
-        SaveToken(newtoken)
-    return newtoken
-
-
-
-
-def GetAuthentication():
-    Log('GetAuthentication girdi')
-    authentication = {PARM_Client_Id: '', PARM_Client_Secret: '', PARM_Username: '', PARM_Password: ''}
-    settings = LoadSettings()
-    Log('LoadSettings cikti')
-    if settings != None:
-        authenticate = settings.find('.//%s' % NODE_AUTHENTICATE)
-        if authenticate != None:
-            if len(authenticate.get(ATTR_AUTH_CLIENT_ID)) > 0:
-                authentication[PARM_Client_Id] = authenticate.get(ATTR_AUTH_CLIENT_ID)
-                Log('ATTR_AUTH_CLIENT_ID(%s)' % authenticate.get(ATTR_AUTH_CLIENT_ID))
-            if len(authenticate.get(ATTR_AUTH_CLIENT_SECRET)) > 0:
-                authentication[PARM_Client_Secret] = authenticate.get(ATTR_AUTH_CLIENT_SECRET)
-                Log('ATTR_AUTH_CLIENT_SECRET(%s)' % authenticate.get(ATTR_AUTH_CLIENT_SECRET))
-            if len(authenticate.get(ATTR_AUTH_USERNAME)) > 0:
-                authentication[PARM_Username] = authenticate.get(ATTR_AUTH_USERNAME)
-                Log('ATTR_AUTH_USERNAME(%s)' % authenticate.get(ATTR_AUTH_USERNAME))
-            if len(authenticate.get(ATTR_AUTH_PASSWORD)) > 0:
-                authentication[PARM_Password] = authenticate.get(ATTR_AUTH_PASSWORD)
-                Log('ATTR_AUTH_PASSWORD(%s)' % authenticate.get(ATTR_AUTH_PASSWORD))
-            pass
-        pass
-    return authentication
-
-def RequestToken():
-    Log('RequestToken girdi')
-    authentication = GetAuthentication()
-    params = urllib.urlencode({
-        PARM_Grant_Type: PARM_Grant_Type_Password,
-        PARM_Client_Id: authentication[PARM_Client_Id],        
-        PARM_Client_Secret: authentication[PARM_Client_Secret],
-        PARM_Username: authentication[PARM_Username],
-        PARM_Password: authentication[PARM_Password]
-        })
-    Log('params(%s)' % params)
-    Log('URL_RequestToken(%s)' % URL_RequestToken)
-    json_data = urllib.urlopen(URL_RequestToken, params, context=ctx).read()
-    return CreateToken(json_data)
-
-
-def RefreshToken(refresh_token):
-    Log('RefreshToken girdi')
-    authentication = GetAuthentication()
-    params = urllib.urlencode({
-        PARM_Grant_Type: PARM_Grant_Type_RefreshToken,
-        PARM_Refresh_Token: refresh_token,
-        PARM_Client_Id: authentication[PARM_Client_Id],        
-        PARM_Client_Secret: authentication[PARM_Client_Secret]
-        })
-    json_data = urllib.urlopen(URL_RequestToken, params, context=ctx).read()
-    return CreateToken(json_data)
-
-    
-def LoadToken():
-    Log('LoadToken girdi')
-    token_filename = GetTokenFileName()
-    Log('LoadToken token_filename(%s)' % token_filename)
-    if os.path.isfile(token_filename):
-        try:
-            tree = ET.parse(token_filename)
-            root = tree.getroot()
-            Log('LoadToken tree(%s)' % tree)
-            Log('LoadToken root(%s)' % root)
-            return root
-        except:            
-            Log('ERROR: in LoadToken(%s)' % token_filename)
-            pass
-    else:
-         Log('dosya bulunamadi! (%s)' % token_filename)
-    return RequestToken()
-
-
-def GetToken():
-    Log('GetToken girdi')
-    token = LoadToken()
-    if token != None:
-        try:
-            # we should always have a token
-            expired_at = datetime.datetime.strptime(token.get(TOKEN_ATTR_EXPIRED_AT), "%Y-%m-%d %H:%M:%S")
-            if expired_at < datetime.datetime.now() + datetime.timedelta(seconds = 30):
-                # is expired or will expire within 30 seconds: Refresh the token
-                token = RefreshToken(token.get(TOKEN_ATTR_REFRESH_TOKEN))
-            pass
-        except:
-            token = None
-            pass
-    if token == None:
-        DeleteTokenFile()
-    return token                                 
-
-
-def SaveMeasures(measures):
-    Log('SaveMeasures girdi')
-    measure_filename = GetMeasuresFileName()
-    if ET.iselement(measures):
-        try:
-            ET.ElementTree(measures).write(measure_filename)
+            if self.path.exists():
+                self.path.unlink()
         except Exception:
-            Log('ERROR: in SaveMeasures(%s)' % measure_filename)            
-            pass
-    pass
+            logging.exception("Failed to delete token file: %s", self.path)
 
 
+# -----------------------------
+# Measures cache (XML, compatible)
+# -----------------------------
+class MeasuresCacheXML:
+    def __init__(self, path: Path, ttl_seconds: int):
+        self.path = path
+        self.ttl_seconds = ttl_seconds
 
-def CreateMeasures(mDashboard_data, inDashboard_data, intime_utc_str, outtime_utc_str):
-    Log('CreateMeasures girdi')
-    newMeasures = ET.Element('measures')
-    if newMeasures != None:
-        outTemperature = mDashboard_data['Temperature']
-        outHumidity = mDashboard_data['Humidity']
-        ##outTemp_trend = mDashboard_data['temp_trend']
-        outtime_utc = mDashboard_data['time_utc']
-        inTemperature = inDashboard_data['Temperature']
-        inNoise = inDashboard_data['Noise']
-        intime_utc = inDashboard_data['time_utc']
-        #inpressure_trend= inDashboard_data['pressure_trend']
-        inHumidity = inDashboard_data['Humidity']
-        inPressure = inDashboard_data['Pressure']
-        inCO2 = inDashboard_data['CO2']
-        inAbsolutePressure = inDashboard_data['AbsolutePressure']
-        outMinTemp = mDashboard_data['min_temp']
-        outMaxTemp = mDashboard_data['max_temp']
+    def is_fresh(self) -> bool:
+        if not self.path.exists():
+            return False
+        age = time.time() - self.path.stat().st_mtime
+        return age <= self.ttl_seconds
 
-
-        newMeasures.set(MEASURE_outTemperature, str(outTemperature))
-        newMeasures.set(MEASURE_outHumidity, str(outHumidity))
-        ##newMeasures.set(MEASURE_outTemp_trend, str(outTemp_trend))
-        newMeasures.set(MEASURE_outtime_utc, str(outtime_utc))
-        newMeasures.set(MEASURE_inTemperature, str(inTemperature))
-        newMeasures.set(MEASURE_inNoise,  str(inNoise))
-        newMeasures.set(MEASURE_intime_utc, str(intime_utc))
-        #newMeasures.set(MEASURE_inpressure_trend,  inpressure_trend)
-        newMeasures.set(MEASURE_inHumidity, str(inHumidity))
-        newMeasures.set(MEASURE_inPressure, str(inPressure))
-        newMeasures.set(MEASURE_inCO2, str(inCO2))
-        newMeasures.set(MEASURE_inAbsolutePressure, str(inAbsolutePressure))
-        newMeasures.set(MEASURE_intime_utc_str, intime_utc_str)
-        newMeasures.set(MEASURE_outtime_utc_str, str(outtime_utc_str))
-        newMeasures.set(MEASURE_outMinTemp, str(outMinTemp))
-        newMeasures.set(MEASURE_outMaxTemp, str(outMaxTemp))
-        
-    return newMeasures
-
-def LoadMeasures():
-    Log('LoadMeasures girdi')
-    measures_filename = GetMeasuresFileName()
-    Log('LoadMeasures measures_filename(%s)' % measures_filename)
-    if os.path.isfile(measures_filename):
+    def load(self) -> Optional[Measures]:
+        if not self.path.exists():
+            return None
         try:
-            tree = ET.parse(measures_filename)
-            root = tree.getroot()
-            Log('LoadMeasures tree(%s)' % tree)
-            Log('LoadMeasures root(%s)' % root)
-            return root
-        except:            
-            Log('ERROR: in LoadMeasures(%s)' % measures_filename)
-            pass
-    else:
-         Log('dosya bulunamadi! (%s)' % measures_filename)
-    return None
+            root = ET.parse(self.path).getroot()
+            # Stored as attributes on <measures .../>
+            def g(name: str, default: str = "") -> str:
+                return (root.get(name) or default).strip()
 
-
-def GetMeasuresForMQTT(token):
-    Log('GetMeasuresForMQTT girdi')
-    expired = False
-    measures = LoadMeasures()
-    if  measures != None:
-        Log('measures (%s)' % measures)
-
-            # we should always have a token
-        modified_at = os.path.getmtime(GetMeasuresFileName())
-        diff = time.time() - os.path.getmtime(GetMeasuresFileName())
-        Log('diff (%s)' % diff)
-           
-        if diff > minNetatmoServerConnect :
-                # is expired or will expire within 30 seconds: Refresh the token
-            expired = True
-            Log('expired')
-
-    Log('measures (%s)' % measures)
-    if measures == None or expired:
-        Log('measures none or expired')
-        measures = GetStationData(token)
-        SaveMeasures(measures)
-    SendMeasuresMQTT(measures)
-    return None                
-
-####################################################################################################
-## Devices
-####################################################################################################
-    
-def GetSettingsFileName():
-    return GetWorkingPath() + "netatmo_settings.xml"
-
-
-def AddSubElement(node, tag):
-    Log('AddSubElement girdi')
-    if node != None and tag != None:
-        return ET.SubElement(node, tag)
-    return None
-
-    
-def SaveSettings(settings):
-    Log('SaveSettings girdi')
-    filename = GetSettingsFileName()
-    if ET.iselement(settings):
-        try:
-            ET.ElementTree(settings).write(filename)
+            return Measures(
+                out_temperature=g("out_temperature"),
+                out_humidity=g("outHumidity"),
+                out_time_utc=g("outtime_utc"),
+                out_time_utc_str=g("outtime_utc_str"),
+                out_min_temp=g("outMinTemp"),
+                out_max_temp=g("outMaxTemp"),
+                in_temperature=g("inTemperature"),
+                in_humidity=g("inHumidity"),
+                in_pressure=g("inPressure"),
+                in_co2=g("inCO2"),
+                in_time_utc=g("intime_utc"),
+                in_time_utc_str=g("intime_utc_str"),
+            )
         except Exception:
-            Log('ERROR: in SaveSettings(%s)' % filename)            
-            pass
-    pass    
-    
+            logging.exception("Failed to load measures cache: %s", self.path)
+            return None
 
-def CreateSettings():
-    Log('CreateSettings girdi')
-    settings = ET.Element(SETTINGS_ROOT)
-    Log('SETTINGS_ROOT(%s)' % SETTINGS_ROOT)
-    if settings != None:
-        authenticate = AddSubElement(settings, NODE_AUTHENTICATE)
-        authenticate.set(ATTR_AUTH_CLIENT_ID, 'CLIENT_ID')
-        authenticate.set(ATTR_AUTH_CLIENT_SECRET, 'CLIENT_SECRET')
-        authenticate.set(ATTR_AUTH_USERNAME, 'USERNAME')
-        authenticate.set(ATTR_AUTH_PASSWORD, 'PASSWORD')
-        domoticz = AddSubElement(settings, NODE_DOMOTICZ)
-        domoticz.set(ATTR_DOMOTICZ_URL, 'http://127.0.0.1:8080')
-        domoticz.set(ATTR_DOMOTICZ_HARDWARE_ID, '10')
-        devices = AddSubElement(settings, DEVICES_ROOT)
-        SaveSettings(settings)
-    return settings
+    def save(self, measures: Measures) -> None:
+        root = ET.Element("measures")
+        # Keep old attribute keys for backward compatibility
+        root.set("out_temperature", measures.out_temperature)
+        root.set("outHumidity", measures.out_humidity)
+        root.set("outtime_utc", measures.out_time_utc)
+        root.set("outtime_utc_str", measures.out_time_utc_str)
+        root.set("outMinTemp", measures.out_min_temp)
+        root.set("outMaxTemp", measures.out_max_temp)
+
+        root.set("inTemperature", measures.in_temperature)
+        root.set("inHumidity", measures.in_humidity)
+        root.set("inPressure", measures.in_pressure)
+        root.set("inCO2", measures.in_co2)
+        root.set("intime_utc", measures.in_time_utc)
+        root.set("intime_utc_str", measures.in_time_utc_str)
+
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
 
 
-def LoadSettings():
-    Log('LoadSettings girdi')
-    filename = GetSettingsFileName()
-    Log('GetSettingsFileName %s)' % filename)
-    if os.path.isfile(filename):
+# -----------------------------
+# Netatmo API client
+# -----------------------------
+class NetatmoClient:
+    def __init__(self, auth: Authentication, ssl_ctx: ssl.SSLContext, token_store: TokenStoreXML):
+        self.auth = auth
+        self.ssl_ctx = ssl_ctx
+        self.token_store = token_store
+
+    def get_token(self) -> Token:
+        token = self.token_store.load()
+        if token is None:
+            logging.info("No token found, requesting a new token.")
+            token = self._request_token()
+            self.token_store.save(token)
+            return token
+
+        if token.is_expiring_soon:
+            logging.info("Token expiring soon, refreshing.")
+            token = self._refresh_token(token.refresh_token)
+            self.token_store.save(token)
+        return token
+
+    def _request_token(self) -> Token:
+        payload = {
+            "grant_type": "password",
+            "client_id": self.auth.client_id,
+            "client_secret": self.auth.client_secret,
+            "username": self.auth.username,
+            "password": self.auth.password,
+        }
+        raw = http_post_form(NETATMO_TOKEN_URL, payload, self.ssl_ctx)
+        return self._token_from_json(raw)
+
+    def _refresh_token(self, refresh_token: str) -> Token:
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.auth.client_id,
+            "client_secret": self.auth.client_secret,
+        }
+        raw = http_post_form(NETATMO_TOKEN_URL, payload, self.ssl_ctx)
+        return self._token_from_json(raw)
+
+    @staticmethod
+    def _token_from_json(raw: str) -> Token:
         try:
-            tree = ET.parse(filename)
-            root = tree.getroot()
-            return root
-        except:            
-            Log('ERROR: in LoadSettings(%s)' % filename)
-            pass
-    else:
-        Log('dosya bulunamadi! (%s)' % filename)
-    return CreateSettings()   
-    
+            data = json.loads(raw)
+            expires_in = int(data["expires_in"])
+            expired_at = dt.datetime.now() + dt.timedelta(seconds=expires_in)
+            return Token(
+                access_token=data["access_token"],
+                refresh_token=data["refresh_token"],
+                expires_in=expires_in,
+                expired_at=expired_at,
+            )
+        except Exception as e:
+            raise RuntimeError("Failed to parse token response from Netatmo.") from e
 
-def GetDomoticzIds(device_ids, device_id, module_id, data_type):
-    Log('GetDomoticzIds girdi')
-    domoticz_ids = {"domoticz_dev_id" : "", "domoticz_dev_type": "", "domoticz_dev_subtype" : ""}
-    if device_ids != None:
+    def get_station_measures(self, access_token: str) -> Measures:
+        params = {"access_token": access_token}
+        raw = http_get(NETATMO_GETSTATIONSDATA_URL, params, self.ssl_ctx)
         try:
-            device_present = False
-            # cannot get this one to work (using multiple attributes)
-            xpath = '//%s[@id="%s" and @module_id="%s" and @data_type="%s"]' % (DEVICES_NODE_DEVICE, device_id, module_id, data_type)
-            xpath = './/%s[@id="%s"]' % (DEVICES_NODE_DEVICE, device_id)
-            device_list = device_ids.findall(xpath)
-            for device in device_list:
-                if device.get("module_id") == module_id and device.get("data_type") == data_type:
-                    device_present = True
-                    domoticz_ids["domoticz_dev_id"] = device.get("domoticz_dev_id")
-                    domoticz_ids["domoticz_dev_type"] = device.get("domoticz_dev_type")
-                    domoticz_ids["domoticz_dev_subtype"] = device.get("domoticz_dev_subtype")
-                    break
-            if device_present == False:
-                new_device = AddSubElement(device_ids, DEVICES_NODE_DEVICE)
-                new_device.set("id", device_id)
-                new_device.set("module_id", module_id)
-                new_device.set("data_type", data_type)
-                new_device.set("domoticz_dev_id", "")
-                new_device.set("domoticz_dev_type", "")
-                new_device.set("domoticz_dev_subtype", "")
-        except:
-            pass
-    return domoticz_ids
-                    
-    
-def AddMeasures(root, data_types, device_ids):
-    Log('AddMeasures girdi')
-    if root == None or data_types == None:
-        return
-    device_id = root.get(DEVICES_ID)
-    module_id = root.get("module_id")
-    for data_type in data_types:
-        data_element = AddSubElement (root, DEVICES_NODE_MEASURE)         
-        data_element.set("data_type", data_type)
-        domoticz_ids = GetDomoticzIds(device_ids, device_id, module_id, data_type)
-        for domoticz_id in domoticz_ids.keys():
-            data_element.set(domoticz_id, domoticz_ids[domoticz_id])
-    pass
+            payload = json.loads(raw)
+        except Exception as e:
+            raise RuntimeError("Failed to decode Netatmo station data JSON.") from e
+
+        if payload.get("status") != "ok":
+            raise RuntimeError(f"Netatmo API error: status={payload.get('status')} body={payload.get('error')}")
+
+        devices = (payload.get("body") or {}).get("devices") or []
+        if not devices:
+            raise RuntimeError("No Netatmo devices found in response.")
+
+        main = devices[0]
+        modules = main.get("modules") or []
+        if not modules:
+            raise RuntimeError("No Netatmo modules found under main device.")
+
+        # Your old script used modules[0] as outdoor and main device as indoor
+        outdoor = modules[0]
+
+        m_dash = outdoor.get("dashboard_data") or {}
+        in_dash = main.get("dashboard_data") or {}
+
+        # Extract timestamps and staleness markers
+        out_time_utc = int(m_dash.get("time_utc", 0))
+        in_time_utc = int(in_dash.get("time_utc", 0))
+        out_time_utc_str_val = parse_timestamp(out_time_utc)[1] if out_time_utc else "unknown"
+        in_time_utc_str_val = parse_timestamp(in_time_utc)[1] if in_time_utc else "unknown"
+
+        now_ts = int(time.time())
+        if out_time_utc and (now_ts - out_time_utc) > STALE_READING_SECONDS:
+            out_time_utc_str_val = "outofdate"
+        if in_time_utc and (now_ts - in_time_utc) > STALE_READING_SECONDS:
+            in_time_utc_str_val = "outofdate"
+
+        # All values stored as strings for MQTT payload simplicity
+        return Measures(
+            out_temperature=str(m_dash.get("Temperature", "")),
+            out_humidity=str(m_dash.get("Humidity", "")),
+            out_time_utc=str(out_time_utc),
+            out_time_utc_str=out_time_utc_str_val,
+            out_min_temp=str(m_dash.get("min_temp", "")),
+            out_max_temp=str(m_dash.get("max_temp", "")),
+            in_temperature=str(in_dash.get("Temperature", "")),
+            in_humidity=str(in_dash.get("Humidity", "")),
+            in_pressure=str(in_dash.get("Pressure", "")),
+            in_co2=str(in_dash.get("CO2", "")),
+            in_time_utc=str(in_time_utc),
+            in_time_utc_str=in_time_utc_str_val,
+        )
 
 
-def AddDevices(root, devices, device_ids, unit, is_module):
-    Log('AddDevices girdi')
-    if root == None or devices == None or device_ids == None:
-        return unit
-    for device in devices:
-        unit += 1
-        if is_module == True:
-            device_id = device["main_device"]
-            module_id = device["_id"]
-        else:
-            device_id = device["_id"]
-            module_id = ""
-        module_name = device["module_name"]
-        device_element = AddSubElement (root, DEVICES_NODE_DEVICE)         
-        device_element.set(DEVICES_ID, device_id); 
-        device_element.set("module_id", module_id); 
-        device_element.set("module_name", module_name);
-        device_element.set("dunit", str(unit))
-        AddMeasures(device_element, device["data_type"], device_ids)        
-    return unit
+# -----------------------------
+# MQTT publisher
+# -----------------------------
+class MqttPublisher:
+    def __init__(self, host: str, port: int, client_id: str = "netatmo-publisher"):
+        self.host = host
+        self.port = port
+        self.client = mqtt.Client(client_id=client_id)
+        self.client.on_connect = self._on_connect
+
+    @staticmethod
+    def _on_connect(client: mqtt.Client, userdata, flags, rc):
+        logging.info("MQTT connected rc=%s", rc)
+
+    def publish_many(self, payloads: Dict[str, str], retain: bool = True) -> None:
+        self.client.connect(self.host, self.port, keepalive=60)
+        self.client.loop_start()
+
+        try:
+            for topic, value in payloads.items():
+                if value is None:
+                    continue
+                self.client.publish(topic, payload=str(value), qos=0, retain=retain)
+                logging.debug("MQTT publish %s => %s", topic, value)
+            # give the network loop a moment to flush publishes
+            time.sleep(1.0)
+        finally:
+            self.client.loop_stop()
+            self.client.disconnect()
 
 
-def GetMeasures(devices, access_token):
-    Log('GetMeasures girdi')
+# -----------------------------
+# Main
+# -----------------------------
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Publish Netatmo station measures to MQTT.")
+    p.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
+    p.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
+    p.add_argument("--cache-ttl", type=int, default=DEFAULT_CACHE_TTL_SECONDS, help="API cache TTL seconds")
+    p.add_argument("--insecure", action="store_true", help="Disable TLS verification (debug only)")
+    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    base = working_dir()
+    settings_path = base / SETTINGS_XML
+    token_path = base / TOKEN_XML
+    measures_path = base / MEASURES_XML
+
+    ssl_ctx = build_ssl_context(args.insecure)
+
+    auth = SettingsStore(settings_path).load_or_create()
+    token_store = TokenStoreXML(token_path)
+    measures_cache = MeasuresCacheXML(measures_path, ttl_seconds=args.cache_ttl)
+
+    netatmo = NetatmoClient(auth=auth, ssl_ctx=ssl_ctx, token_store=token_store)
+    publisher = MqttPublisher(host=args.mqtt_host, port=args.mqtt_port)
+
     try:
-        # cannot get this one to work using multiple attributes
-        xpath = './/%s' % DEVICES_NODE_DEVICE
-        device_list = devices.findall(xpath)
-        for device in device_list:
-            device_id = device.get("id")
-            module_id = device.get("module_id")
-            xpath_measure = './/%s' % DEVICES_NODE_MEASURE
-            measure_list = device.findall(xpath_measure)
-            for measure in measure_list:
-                if module_id != None:
-                    params = urllib.urlencode({
-                        PARM_Access_Token: access_token,
-                        PARM_Device_Id: device_id,
-                        PARM_Module_Id: module_id,
-                        PARM_Scale: PARM_Scale_Max,
-                        PARM_Measure_Type: measure.get("data_type"),
-                        PARM_Date_End: PARM_Date_End_Last,
-                        PARM_Optimize: "True"                    
-                        })
-                else:
-                    params = urllib.urlencode({
-                        PARM_Access_Token: access_token,
-                        PARM_Device_Id: device_id,
-                        PARM_Scale: PARM_Scale_Max,
-                        PARM_Measure_Type: measure.get("data_type"),
-                        PARM_Date_End: PARM_Date_End_Last,
-                        PARM_Optimize: "True"                    
-                        })
-                json_data = urllib.urlopen(URL_GetMeasure, params,  context=ctx).read()
-                measure_response = json.loads(json_data)
-                if measure_response != None and RESPONSE_Status in measure_response.keys() and measure_response[RESPONSE_Status] == RESPONSE_Status_OK:
-                    body = measure_response[RESPONSE_Body]
-                    value = body[0]["value"][0][0]
-                    measure.set("value", str(value))
-                    pass
-    except:
-        pass    
-    #pass
+        # Token
+        token = netatmo.get_token()
 
-
-def MeasureIsValid(measure):
-    Log('MeasureIsValid girdi')
-    if measure.get("data_type") != None and len(measure.get("data_type")) > 0 and \
-       measure.get("domoticz_dev_id") != None and len(measure.get("domoticz_dev_id")) > 0 and \
-       measure.get("domoticz_dev_type") != None and len(measure.get("domoticz_dev_type")) > 0 and \
-       measure.get("domoticz_dev_subtype") != None and len(measure.get("domoticz_dev_subtype")) > 0 and \
-       measure.get("value") != None and len(measure.get("value")) > 0:
-        return True
-    return False
-
-
-def AddQueryParameter(name, value, cat = '&'):
-    return '%s%s=%s' % (cat, name, value)
-
-
-def GetNSValues(data_type, value):
-    Log('GetNSValues girdi')
-    values = { PARM_NValue: "0", PARM_SValue: "0" }
-    if data_type == DATATYPE_Temperature:
-        values[PARM_SValue] = value
-    elif data_type == DATATYPE_Humidity:
-        values[PARM_NValue] = value
-        intvalue =int(value)
-        if intvalue < 40:
-            values[PARM_SValue] = HUMSTAT_DRY
-        elif intvalue > 90:
-            values[PARM_SValue] = HUMSTAT_WET
-        elif intvalue >= 50 and intvalue <= 70:
-            values[PARM_SValue] = HUMSTAT_COMFORT
+        # Measures with cache
+        measures: Optional[Measures]
+        if measures_cache.is_fresh():
+            measures = measures_cache.load()
+            logging.info("Using cached measures (%s).", measures_path.name)
         else:
-            values[PARM_SValue] = HUMSTAT_NORMAL                    
-    elif data_type == DATATYPE_CO2:
-        values[PARM_NValue] = value
-    elif data_type == DATATYPE_Pressure:
-        values[PARM_SValue] = value
-    elif data_type == DATATYPE_Noise:
-        values[PARM_NValue] = value
-    return values
+            measures = None
+
+        if measures is None:
+            logging.info("Fetching measures from Netatmo.")
+            measures = netatmo.get_station_measures(token.access_token)
+            measures_cache.save(measures)
+
+        # Publish
+        payloads = measures.to_mqtt_payloads()
+        publisher.publish_many(payloads, retain=True)
+        logging.info("Published %d topics to MQTT.", len(payloads))
+        return 0
+
+    except Exception:
+        logging.exception("Fatal error.")
+        # If token issues occur, allow clean re-auth on next run
+        # (but do NOT delete token on every random error)
+        return 1
 
 
-def TransferSingleMeasure(url, hardware_id, unit, measure):
-    Log('TransferSingleMeasure girdi')
-    if MeasureIsValid(measure):
-        url = '%s%s' % (url, URL_JSON)
-        url += AddQueryParameter(PARM_Type, PARM_Type_Command, '?')
-        url += AddQueryParameter(PARM_Param, PARM_Param_UpdateDevice)
-        url += AddQueryParameter(PARM_HardwareId, hardware_id)
-        url += AddQueryParameter(PARM_DeviceId, measure.get("domoticz_dev_id"))
-        url += AddQueryParameter(PARM_DeviceUnit, unit)
-        url += AddQueryParameter(PARM_DeviceType, measure.get("domoticz_dev_type"))
-        url += AddQueryParameter(PARM_DeviceSubType, measure.get("domoticz_dev_subtype"))
-        values = GetNSValues(measure.get("data_type"), measure.get("value"))
-        for value in values.keys():
-            url += AddQueryParameter(value, values[value])
-        urllib.urlopen(url, context=ctx)
-        pass
-    pass
-
-
-def TransferMeasures(devices, url, hardware_id):
-    Log('TransferMeasures girdi')
-    # Transfer all measurements to DomoticZ
-    try:
-        xpath = './/%s' % DEVICES_NODE_DEVICE
-        device_list = devices.findall(xpath)
-        for device in device_list:
-            unit = device.get("dunit")
-            xpath_measure = './/%s[@value]' % DEVICES_NODE_MEASURE
-            measure_list = device.findall(xpath_measure)
-            for measure in measure_list:
-                TransferSingleMeasure(url, hardware_id, unit, measure)
-                pass
-        pass
-    except:
-        Log("Error in TransferMeasures")
-        pass    
-    #ET.dump(devices)
-    pass
-
-
-def HandleDevices(json_data, access_token):
-    Log('HandleDevices girdi')
-    Log('json_data(%s)' % json_data)  
-    if json_data != None:
-        try:
-            device = json.loads(json_data)
-            if RESPONSE_Status in device.keys() and RESPONSE_Body in device.keys() and device[RESPONSE_Status] == RESPONSE_Status_OK:
-                body = device[RESPONSE_Body]
-                settings = LoadSettings()
-                domoticz = settings.find('.//%s' % NODE_DOMOTICZ)                
-                device_ids = settings.find('.//%s' % DEVICES_ROOT)
-                devices = ET.Element(DEVICES_ROOT)
-                if devices != None:
-                    # Build the actual device list
-                    unit = AddDevices(devices, body['devices'], device_ids, 0, False)
-                    unit = AddDevices(devices, body['modules'], device_ids, unit, True)
-                    if domoticz != None and domoticz.get(ATTR_DOMOTICZ_HARDWARE_ID) == None:
-                        domoticz.set(ATTR_DOMOTICZ_HARDWARE_ID, "100")
-                    SaveSettings(settings)
-                    # Get the actual measurement values from Netatmo service
-                    GetMeasures(devices, access_token)
-                    if domoticz != None and domoticz.get(ATTR_DOMOTICZ_URL) != None:
-                        # Transfer the measurements to DomoticZ
-                        TransferMeasures(devices, domoticz.get(ATTR_DOMOTICZ_URL), domoticz.get(ATTR_DOMOTICZ_HARDWARE_ID))
-        except:
-            pass
-    pass
-
-    
-def UpdateDeviceList(access_token):
-    Log('UpdateDeviceList girdi')
-    Log('access_token(%s)' % access_token)  
-    if access_token != None:
-        params = urllib.urlencode({
-            PARM_Access_Token: access_token
-            })
-        Log('params(%s)' % params)
-        json_data = urllib.urlopen(URL_DeviceList, params, context=ctx).read()
-        HandleDevices(json_data, access_token)
-    pass
-
-
-
-def GetStationData(access_token):
-    Log('GetStationData girdi')
-    Log('access_token(%s)' % access_token)  
-    if access_token != None:
-        params = urllib.urlencode({
-            PARM_Access_Token: access_token
-            })
-        Log('params(%s)' % params)
-        json_data = urllib.urlopen(URL_GetStationData, params, context=ctx).read()
-        ##Log('json_data(%s)' % json_data)
-        if json_data != None:
-                    allJsonData = json.loads(json_data)
-                    rawData = allJsonData['body']['devices']
-                    if not rawData : raise NoDevice("No weather station available")
-                    stations = { d['_id'] : d for d in rawData }
-                    modules = dict()
-                    module = rawData[0]['modules'][0]
-                    print(module)
-                    mDashboard_data = module['dashboard_data']
-                    inDashboard_data = rawData[0]['dashboard_data']
-                    
-                    outTemperature = mDashboard_data['Temperature']
-                    outHumidity = mDashboard_data['Humidity']
-                   ## outTemp_trend = mDashboard_data['temp_trend']
-                    outtime_utc = mDashboard_data['time_utc']
-                    outMinTemp = mDashboard_data['min_temp']
-                    outMaxTemp = mDashboard_data['max_temp'] 
-
-                    inTemperature = inDashboard_data['Temperature']
-                    inNoise = inDashboard_data['Noise']
-                    intime_utc = inDashboard_data['time_utc']
-                    #inpressure_trend= inDashboard_data['pressure_trend']
-                    inHumidity = inDashboard_data['Humidity']
-                    inPressure = inDashboard_data['Pressure']
-                    inCO2 = inDashboard_data['CO2']
-                    inAbsolutePressure = inDashboard_data['AbsolutePressure']
-
-                    from datetime import datetime
-                    intime_utc_str = datetime.fromtimestamp(int(intime_utc)).strftime('%Y-%m-%d_%H:%M:%S')
-                    outtime_utc_str = datetime.fromtimestamp(int(outtime_utc)).strftime('%Y-%m-%d_%H:%M:%S')
-                    import time
-                    tsNow = time.time()
-                    difOutTime = tsNow - int(outtime_utc);
-                    difInTime = tsNow - int(intime_utc);
-                    
-                    Log('*')
-                    Log('mDashboard_data(%s)' % mDashboard_data)
-                    Log('tsNow(%s)' % tsNow)
-                    Log('difOutTime(%s)' % difOutTime)
-                    Log('difInTime(%s)' % difInTime)
-                    Log('intime_utc_str(%s)' % intime_utc_str)
-                    Log('outtime_utc_str(%s)' % outtime_utc_str)
-                    Log('outHumidity(%s)' % outHumidity)
-                    Log('outTemperature(%s)' % outTemperature)
-                    ##Log('outTemp_trend(%s)' % outTemp_trend)
-
-                    Log('inTemperature(%s)' % inTemperature)
-                    Log('inNoise(%s)' % inNoise)
-                    Log('intime_utc(%s)' % intime_utc)
-                    #Log('inpressure_trend(%s)' % inpressure_trend)                              
-                    Log('inHumidity(%s)' % inHumidity)
-                    Log('inPressure(%s)' % inPressure)  
-                    Log('inCO2(%s)' % inCO2)
-                    Log('inAbsolutePressure(%s)' % inAbsolutePressure)
-                    Log('outMinTemp(%s)' % outMinTemp)
-                    Log('outMaxTemp(%s)' % outMaxTemp)
-
-                    if (difOutTime > 3000):
-                        outtime_utc_str = 'outofdate'
-                    if (difInTime > 3000):
-                        intime_utc_str = 'outofdate'
-                    measures = CreateMeasures(mDashboard_data, inDashboard_data, intime_utc_str, outtime_utc_str)
-                    return measures
-                    pass
-    pass
-
-####################################################################################################
-## Main entry
-####################################################################################################
-
-def main():
-    ###pdb.set_trace()
-    token = GetToken()
-    
-    if token != None:
-        measures = GetMeasuresForMQTT(token.get(TOKEN_ATTR_ACCESS_TOKEN))
-       ## GetStationData(token.get(TOKEN_ATTR_ACCESS_TOKEN))
-        
-    
 if __name__ == "__main__":
-    main()
-
-
-
+    raise SystemExit(main())

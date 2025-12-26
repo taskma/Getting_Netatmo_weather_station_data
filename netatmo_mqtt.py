@@ -2,6 +2,7 @@
 """
 netatmo_mqtt.py
 
+
 Requirements
 - Python 3.9+
 - paho-mqtt (pip install paho-mqtt)

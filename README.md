@@ -4,7 +4,7 @@ Fetches Netatmo station data and publishes telemetry via MQTT.
 
 ## Prerequisites
 - Netatmo developer credentials
-- `netatmo_settings.xml` filled with your tokens (**DO NOT commit secrets**)
+- `netatmo_settings.xml` filled with your tokens
 - MQTT broker
 
 ## Run

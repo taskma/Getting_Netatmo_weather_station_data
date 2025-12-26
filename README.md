@@ -31,10 +31,12 @@ The script publishes each metric to a dedicated MQTT topic (retained by default)
 
 ```mermaid
 flowchart LR
-  N["Python Script\\nnetatmo_mqtt.py"] -->|HTTPS| A["Netatmo API"]
-  N -->|MQTT publish (retained)| B["MQTT Broker"]
-  HA["Home Assistant / Node-RED"] <--> B
-  APP["CLI / Custom Apps"] <--> B
+  N[Python Script: netatmo_mqtt.py] -->|HTTPS| A[Netatmo API]
+  N -->|MQTT publish, retained| B[MQTT Broker]
+  HA[Home Assistant / Node-RED] --> B
+  B --> HA
+  APP[CLI / Custom Apps] --> B
+  B --> APP
 ```
 
 ---
